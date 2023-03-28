@@ -1,0 +1,232 @@
+import pandas as pd 
+import json
+from gensim.utils import simple_preprocess
+from gensim.parsing.porter import PorterStemmer
+from gensim.models import Word2Vec
+from sklearn.model_selection import train_test_split
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import torch
+import gensim
+from sklearn.metrics import classification_report
+from pathlib import Path 
+import numpy as np
+
+
+device = torch.device("mps")
+
+#Load data from json file
+def load_data():
+    f = open("./yelp_dataset/review.json", 'r')
+    data = []
+    count = 0
+    
+    for line in f:
+        data.append(json.loads(line))
+        count += 1
+
+        if count == 100: #get first num of reviews...large!!
+            break
+
+    dataset= pd.DataFrame(data)
+    f.close()
+
+    return dataset
+
+#Map stars to sentiment
+def map_sentiment(stars_received):
+    if stars_received <= 2:
+        return -1
+    elif stars_received == 3:
+        return 0
+    else:
+        return 1
+
+#Data Preprocessing
+def preprocessing():
+    #tokenize data
+    dataset['tokenized_text'] = [simple_preprocess(line, deacc=True) for line in dataset['text']] 
+
+    #Stemming
+    porter_stemmer = PorterStemmer()
+    dataset['stemmed_tokens'] = [[porter_stemmer.stem(word) for word in tokens] for tokens in dataset['tokenized_text']]
+
+    # Mapping stars to sentiment into three categories
+    dataset['sentiment'] = [ map_sentiment(x) for x in dataset['stars']]
+
+
+dataset= load_data()
+preprocessing()
+
+#split the data
+X_train, X_test, Y_train, Y_test = train_test_split(dataset[['business_id', 'cool', 'date', 'funny', 'review_id', 'stars', 'text', 'useful', 'user_id', 'stemmed_tokens']], dataset['sentiment'], shuffle=True, test_size=0.3, random_state=15)
+
+#word2vec model
+def word2Vec_model():
+    #With padding
+    temp_df = pd.Series(dataset['stemmed_tokens']).values
+    temp_df = list(temp_df)
+    temp_df.append(['pad'])
+    word2vec_file = 'word2vec_PAD.model'
+
+    w2v_model = Word2Vec(temp_df, min_count = 1, workers = 3, vector_size=500, window = 3, sg = 1)
+
+    w2v_model.save(word2vec_file)
+    return w2v_model, word2vec_file
+
+# Train Word2vec model
+w2vmodel, word2vec_file = word2Vec_model()
+
+#pass words into model
+max_sen_len = dataset.stemmed_tokens.map(len).max()
+padding_idx = w2vmodel.wv.key_to_index['pad']
+
+def make_word2vec_vector_lstm(sentence):
+    padded_X = [padding_idx for i in range(max_sen_len)]
+    i = 0
+    for word in sentence:
+        if word not in w2vmodel.wv.index_to_key:
+            padded_X[i] = 0
+            print(word)
+        else:
+            padded_X[i] = w2vmodel.wv.key_to_index[word]
+        i += 1
+    return torch.tensor(padded_X, dtype=torch.long, device=device).view(1, -1)
+
+# Function to get the output tensor
+def make_target(label):
+    if label == -1:
+        return torch.tensor([0], dtype=torch.long, device=device)
+    elif label == 0:
+        return torch.tensor([1], dtype=torch.long, device=device)
+    else:
+        return torch.tensor([2], dtype=torch.long, device=device)
+
+#Create  lstm
+EMBEDDING_SIZE = 500
+NUM_FILTERS = 10
+
+class LSTMTagger(nn.Module):
+    def __init__(self, vocab_size, num_classes, window_sizes=(1,2,3,5)):
+        super(LSTMTagger, self).__init__()
+        w2vmodel = gensim.models.KeyedVectors.load('word2vec_PAD.model')
+        weights = w2vmodel.wv
+
+        # With pretrained embeddings
+        self.embedding = nn.Embedding.from_pretrained(torch.FloatTensor(weights.vectors), padding_idx=w2vmodel.wv.key_to_index['pad'])
+        # Without pretrained embeddings
+        #self.embedding = nn.Embedding(vocab_size, EMBEDDING_SIZE)
+
+        self.lstm = nn.LSTM(EMBEDDING_SIZE, NUM_FILTERS)
+
+        self.fc = nn.Linear(NUM_FILTERS, num_classes)
+
+    def forward(self, x):
+        embeds = self.embedding(x) #[1, 398, 500]
+
+        # Apply a convolution + max_pool layer for each window size
+        x2, (h_n, c_n) = self.lstm(embeds) #[1, 398, 10]
+        x2 = F.relu(x2) #[1, 398, 10]
+        trans= x2[0].T #[10,398]
+        x2=torch.reshape(trans, (1,10,trans.shape[-1]))
+        x2= F.max_pool1d(x2, x2.size(2)) #[1, 10, 1]
+
+        # FC
+        x = x2.view(x2.size(0), -1)
+        logits = self.fc(x) #input= [1,10], output= [1,3]
+
+        probs = F.softmax(logits, dim = 1)
+
+        return probs #needs to be shape [1,3]
+    
+
+#Training the model
+NUM_CLASSES = 3
+VOCAB_SIZE = len(w2vmodel.wv.index_to_key)
+
+lstm_model = LSTMTagger(vocab_size=VOCAB_SIZE, num_classes=NUM_CLASSES)
+lstm_model.to(device)
+loss_function = nn.CrossEntropyLoss()
+optimizer = optim.Adam( lstm_model.parameters(), lr=0.001)
+num_epochs = 30
+
+# Open the file for writing loss
+loss_file_name = 'loss.csv'
+f = open(loss_file_name,'w')
+f.write('iter, loss')
+f.write('\n')
+losses = []
+lstm_model.train()
+for epoch in range(num_epochs):
+    print("Epoch " + str(epoch + 1))
+    train_loss = 0
+    for index, row in X_train.iterrows():
+        # Clearing the accumulated gradients
+        lstm_model.zero_grad()
+
+        # Make the bag of words vector for stemmed tokens 
+        bow_vec = make_word2vec_vector_lstm(row['stemmed_tokens'])
+    
+        # Forward pass to get output
+        probs =  lstm_model(bow_vec)
+
+        # Get the target label
+        target = make_target(Y_train[index])
+
+        # Calculate Loss: softmax --> cross entropy loss
+        loss = loss_function(probs, target)
+        train_loss += loss.item()
+
+        # Getting gradients w.r.t. parameters
+        loss.backward()
+
+        # Updating parameters
+        optimizer.step()
+
+
+    # if index == 0:
+    #     continue
+    print("Epoch ran :"+ str(epoch+1))
+    f.write(str((epoch+1)) + "," + str(train_loss / len(X_train)))
+    f.write('\n')
+    train_loss = 0
+breakpoint()
+torch.save( lstm_model, ' lstm_big_model_500_with_padding.pth')
+f.close()
+
+#Testing the model
+bow_lstm_predictions = []
+original_lables_lstm_bow = []
+
+lstm_model.eval()
+
+loss_df = pd.read_csv(loss_file_name)
+print(loss_df.columns)
+# loss_df.plot('loss')
+
+with torch.no_grad():
+    for index, row in X_test.iterrows():
+        bow_vec = make_word2vec_vector_lstm(row['stemmed_tokens'])
+        probs =  lstm_model(bow_vec)
+        _, predicted = torch.max(probs.data, 1)
+        bow_lstm_predictions.append(predicted.cpu().numpy()[0])
+        original_lables_lstm_bow.append(make_target(Y_test[index]).cpu().numpy()[0])
+
+report= classification_report(original_lables_lstm_bow,bow_lstm_predictions, output_dict=True)
+print(report)
+breakpoint()
+df_classification_report = pd.DataFrame(report).transpose()
+df_classification_report = df_classification_report.sort_values(by=['f1-score'], ascending=False)
+filepath = Path('report.csv')
+df_classification_report.to_csv(filepath)  
+
+loss_df = pd.read_csv(loss_file_name)
+print(loss_df.columns)
+plt_500_padding_30_epochs = loss_df[' loss'].plot()
+fig = plt_500_padding_30_epochs.get_figure()
+fig.savefig("loss_plt_500_padding_30_epochs.pdf")
+
+
+#breakpoint()
+
